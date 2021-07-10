@@ -16,37 +16,37 @@ limitations under the License.
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
 namespace tensorflow {
-REGISTER5(BinaryOp, CPU, "Div", functor::div, float, Eigen::half, double,
-          complex64, complex128);
-REGISTER5(BinaryOp, CPU, "Div", functor::safe_div, uint8, uint16, int16, int32,
-          int64);
-REGISTER5(BinaryOp, CPU, "TruncateDiv", functor::safe_div, uint8, uint16, int16,
-          int32, int64);
-REGISTER5(BinaryOp, CPU, "RealDiv", functor::div, float, Eigen::half, double,
-          complex64, complex128);
-#if TENSORFLOW_USE_SYCL
-#define REGISTER_SYCL_KERNEL(TYPE)                                    \
-  REGISTER_KERNEL_BUILDER(                                            \
-                          Name("Div")                                 \
-                          .Device(DEVICE_SYCL)                        \
-                          .TypeConstraint<TYPE>("T"),                 \
-                          BinaryOp<SYCLDevice, functor::div<TYPE>>);  \
-  REGISTER_KERNEL_BUILDER(                                            \
-                          Name("RealDiv")                             \
-                          .Device(DEVICE_SYCL)                        \
-                          .TypeConstraint<TYPE>("T"),                 \
-                          BinaryOp<SYCLDevice, functor::div<TYPE>>);
-REGISTER_SYCL_KERNEL(float)
-REGISTER_SYCL_KERNEL(int32)
-#undef REGISTER_SYCL_KERNEL
-#endif // TENSORFLOW_USE_SYCL
-#if GOOGLE_CUDA
+
+REGISTER6(BinaryOp, CPU, "Div", functor::div, float, Eigen::half, double,
+          bfloat16, complex64, complex128);
+REGISTER8(BinaryOp, CPU, "Div", functor::safe_div, uint8, uint16, uint32,
+          uint64, int8, int16, int32, int64);
+REGISTER8(BinaryOp, CPU, "TruncateDiv", functor::safe_div, uint8, uint16,
+          uint32, uint64, int8, int16, int32, int64);
+REGISTER6(BinaryOp, CPU, "RealDiv", functor::div, float, Eigen::half, double,
+          bfloat16, complex64, complex128);
+REGISTER6(BinaryOp, CPU, "DivNoNan", functor::div_no_nan, Eigen::half, float,
+          double, bfloat16, complex64, complex128);
+
+REGISTER_KERNEL_BUILDER(Name("Div")
+                            .Device(DEVICE_DEFAULT)
+                            .HostMemory("x")
+                            .HostMemory("y")
+                            .HostMemory("z")
+                            .TypeConstraint<int32>("T"),
+                        BinaryOp<CPUDevice, functor::safe_div<int32>>);
+
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if !defined(MLIR_GENERATED_GPU_KERNELS_ENABLED)
 REGISTER9(BinaryOp, GPU, "Div", functor::div, float, Eigen::half, double, uint8,
           uint16, int16, int64, complex64, complex128);
 REGISTER4(BinaryOp, GPU, "TruncateDiv", functor::div, uint8, uint16, int16,
           int64);
 REGISTER5(BinaryOp, GPU, "RealDiv", functor::div, float, Eigen::half, double,
           complex64, complex128);
+REGISTER5(BinaryOp, GPU, "DivNoNan", functor::div_no_nan, Eigen::half, float,
+          double, complex64, complex128);
+#endif
 
 // A special GPU kernel for int32.
 // TODO(b/25387198): Also enable int32 in device memory. This kernel
@@ -58,6 +58,7 @@ REGISTER_KERNEL_BUILDER(Name("Div")
                             .HostMemory("z")
                             .TypeConstraint<int32>("T"),
                         BinaryOp<CPUDevice, functor::safe_div<int32>>);
+
 #endif
 
 }  // namespace tensorflow
