@@ -15,23 +15,31 @@ limitations under the License.
 
 #include "tensorflow/cc/training/coordinator.h"
 
-#include "tensorflow/cc/training/queue_runner.h"
-#include "tensorflow/core/lib/core/blocking_counter.h"
-#include "tensorflow/core/lib/core/error_codes.pb.h"
-#include "tensorflow/core/lib/core/notification.h"
-#include "tensorflow/core/lib/core/status_test_util.h"
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <utility>
+
+#include "absl/status/status.h"
+#include "absl/synchronization/notification.h"
+#include "xla/tsl/lib/core/status_test_util.h"
+#include "xla/tsl/protobuf/error_codes.pb.h"
+#include "tensorflow/core/platform/blocking_counter.h"
 #include "tensorflow/core/platform/env.h"
+#include "tensorflow/core/platform/status.h"
 #include "tensorflow/core/platform/test.h"
-#include "tensorflow/core/public/session.h"
+#include "tensorflow/core/platform/threadpool.h"
+#include "tensorflow/core/protobuf/error_codes.pb.h"
 
 namespace tensorflow {
 namespace {
 
 using error::Code;
 
-void WaitForStopThread(Coordinator* coord, bool* stopped, Notification* done) {
+void WaitForStopThread(Coordinator* coord, absl::Notification* about_to_wait,
+                       absl::Notification* done) {
+  about_to_wait->Notify();
   coord->WaitForStop();
-  *stopped = true;
   done->Notify();
 }
 
@@ -39,25 +47,26 @@ TEST(CoordinatorTest, TestStopAndWaitOnStop) {
   Coordinator coord;
   EXPECT_EQ(coord.ShouldStop(), false);
 
-  bool stopped = false;
-  Notification done;
+  absl::Notification about_to_wait;
+  absl::Notification done;
   Env::Default()->SchedClosure(
-      std::bind(&WaitForStopThread, &coord, &stopped, &done));
-  Env::Default()->SleepForMicroseconds(10000000);
-  EXPECT_EQ(stopped, false);
+      std::bind(&WaitForStopThread, &coord, &about_to_wait, &done));
+  about_to_wait.WaitForNotification();
+  Env::Default()->SleepForMicroseconds(1000 * 1000);
+  EXPECT_FALSE(done.HasBeenNotified());
 
   TF_EXPECT_OK(coord.RequestStop());
   done.WaitForNotification();
-  EXPECT_EQ(stopped, true);
-  EXPECT_EQ(coord.ShouldStop(), true);
+  EXPECT_TRUE(coord.ShouldStop());
 }
 
 class MockQueueRunner : public RunnerInterface {
  public:
-  MockQueueRunner(Coordinator* coord) {
+  explicit MockQueueRunner(Coordinator* coord) {
     coord_ = coord;
     join_counter_ = nullptr;
-    thread_pool_.reset(new thread::ThreadPool(Env::Default(), "test-pool", 10));
+    thread_pool_ =
+        std::make_unique<thread::ThreadPool>(Env::Default(), "test-pool", 10);
     stopped_ = false;
   }
 
@@ -66,17 +75,19 @@ class MockQueueRunner : public RunnerInterface {
     join_counter_ = join_counter;
   }
 
-  void StartCounting(std::atomic<int>* counter, int until) {
+  void StartCounting(std::atomic<int>* counter, int until,
+                     absl::Notification* start = nullptr) {
     thread_pool_->Schedule(
-        std::bind(&MockQueueRunner::CountThread, this, counter, until));
+        std::bind(&MockQueueRunner::CountThread, this, counter, until, start));
   }
 
-  void StartSettingStatus(const Status& status, BlockingCounter* counter) {
-    thread_pool_->Schedule(
-        std::bind(&MockQueueRunner::SetStatusThread, this, status, counter));
+  void StartSettingStatus(const absl::Status& status, BlockingCounter* counter,
+                          absl::Notification* start) {
+    thread_pool_->Schedule(std::bind(&MockQueueRunner::SetStatusThread, this,
+                                     status, counter, start));
   }
 
-  Status Join() {
+  absl::Status Join() override {
     if (join_counter_ != nullptr) {
       (*join_counter_)++;
     }
@@ -84,29 +95,32 @@ class MockQueueRunner : public RunnerInterface {
     return status_;
   }
 
-  Status GetStatus() { return status_; }
+  absl::Status GetStatus() { return status_; }
 
-  void SetStatus(const Status& status) { status_ = status; }
+  void SetStatus(const absl::Status& status) { status_ = status; }
 
   bool IsRunning() const override { return !stopped_; };
 
   void Stop() { stopped_ = true; }
 
  private:
-  void CountThread(std::atomic<int>* counter, int until) {
+  void CountThread(std::atomic<int>* counter, int until,
+                   absl::Notification* start) {
+    if (start != nullptr) start->WaitForNotification();
     while (!coord_->ShouldStop() && counter->load() < until) {
       (*counter)++;
-      Env::Default()->SleepForMicroseconds(100000);
+      Env::Default()->SleepForMicroseconds(10 * 1000);
     }
     coord_->RequestStop().IgnoreError();
   }
-  void SetStatusThread(const Status& status, BlockingCounter* counter) {
-    Env::Default()->SleepForMicroseconds(100000);
+  void SetStatusThread(const absl::Status& status, BlockingCounter* counter,
+                       absl::Notification* start) {
+    start->WaitForNotification();
     SetStatus(status);
     counter->DecrementCount();
   }
   std::unique_ptr<thread::ThreadPool> thread_pool_;
-  Status status_;
+  absl::Status status_;
   Coordinator* coord_;
   int* join_counter_;
   bool stopped_;
@@ -116,11 +130,13 @@ TEST(CoordinatorTest, TestRealStop) {
   std::atomic<int> counter(0);
   Coordinator coord;
 
-  std::unique_ptr<MockQueueRunner> qr1(new MockQueueRunner(&coord));
+  std::unique_ptr<MockQueueRunner> qr1 =
+      std::make_unique<MockQueueRunner>(&coord);
   qr1->StartCounting(&counter, 100);
   TF_ASSERT_OK(coord.RegisterRunner(std::move(qr1)));
 
-  std::unique_ptr<MockQueueRunner> qr2(new MockQueueRunner(&coord));
+  std::unique_ptr<MockQueueRunner> qr2 =
+      std::make_unique<MockQueueRunner>(&coord);
   qr2->StartCounting(&counter, 100);
   TF_ASSERT_OK(coord.RegisterRunner(std::move(qr2)));
 
@@ -130,7 +146,7 @@ TEST(CoordinatorTest, TestRealStop) {
   TF_EXPECT_OK(coord.RequestStop());
 
   int temp_counter = counter.load();
-  Env::Default()->SleepForMicroseconds(10000000);
+  Env::Default()->SleepForMicroseconds(1000 * 1000);
   EXPECT_EQ(temp_counter, counter.load());
   TF_EXPECT_OK(coord.Join());
 }
@@ -138,12 +154,14 @@ TEST(CoordinatorTest, TestRealStop) {
 TEST(CoordinatorTest, TestRequestStop) {
   Coordinator coord;
   std::atomic<int> counter(0);
+  absl::Notification start;
   std::unique_ptr<MockQueueRunner> qr;
   for (int i = 0; i < 10; i++) {
-    qr.reset(new MockQueueRunner(&coord));
-    qr->StartCounting(&counter, 10);
+    qr = std::make_unique<MockQueueRunner>(&coord);
+    qr->StartCounting(&counter, 10, &start);
     TF_ASSERT_OK(coord.RegisterRunner(std::move(qr)));
   }
+  start.Notify();
 
   coord.WaitForStop();
   EXPECT_EQ(coord.ShouldStop(), true);
@@ -154,11 +172,11 @@ TEST(CoordinatorTest, TestRequestStop) {
 TEST(CoordinatorTest, TestJoin) {
   Coordinator coord;
   int join_counter = 0;
-  std::unique_ptr<MockQueueRunner> qr1(
-      new MockQueueRunner(&coord, &join_counter));
+  std::unique_ptr<MockQueueRunner> qr1 =
+      std::make_unique<MockQueueRunner>(&coord, &join_counter);
   TF_ASSERT_OK(coord.RegisterRunner(std::move(qr1)));
-  std::unique_ptr<MockQueueRunner> qr2(
-      new MockQueueRunner(&coord, &join_counter));
+  std::unique_ptr<MockQueueRunner> qr2 =
+      std::make_unique<MockQueueRunner>(&coord, &join_counter);
   TF_ASSERT_OK(coord.RegisterRunner(std::move(qr2)));
 
   TF_EXPECT_OK(coord.RequestStop());
@@ -168,28 +186,37 @@ TEST(CoordinatorTest, TestJoin) {
 
 TEST(CoordinatorTest, StatusReporting) {
   Coordinator coord({Code::CANCELLED, Code::OUT_OF_RANGE});
+  absl::Notification start;
   BlockingCounter counter(3);
 
-  std::unique_ptr<MockQueueRunner> qr1(new MockQueueRunner(&coord));
-  qr1->StartSettingStatus(Status(Code::CANCELLED, ""), &counter);
+  std::unique_ptr<MockQueueRunner> qr1 =
+      std::make_unique<MockQueueRunner>(&coord);
+  qr1->StartSettingStatus(absl::Status(absl::StatusCode::kCancelled, ""),
+                          &counter, &start);
   TF_ASSERT_OK(coord.RegisterRunner(std::move(qr1)));
 
-  std::unique_ptr<MockQueueRunner> qr2(new MockQueueRunner(&coord));
-  qr2->StartSettingStatus(Status(Code::INVALID_ARGUMENT, ""), &counter);
+  std::unique_ptr<MockQueueRunner> qr2 =
+      std::make_unique<MockQueueRunner>(&coord);
+  qr2->StartSettingStatus(absl::Status(absl::StatusCode::kInvalidArgument, ""),
+                          &counter, &start);
   TF_ASSERT_OK(coord.RegisterRunner(std::move(qr2)));
 
-  std::unique_ptr<MockQueueRunner> qr3(new MockQueueRunner(&coord));
-  qr3->StartSettingStatus(Status(Code::OUT_OF_RANGE, ""), &counter);
+  std::unique_ptr<MockQueueRunner> qr3 =
+      std::make_unique<MockQueueRunner>(&coord);
+  qr3->StartSettingStatus(absl::Status(absl::StatusCode::kOutOfRange, ""),
+                          &counter, &start);
   TF_ASSERT_OK(coord.RegisterRunner(std::move(qr3)));
 
+  start.Notify();
   counter.Wait();
   TF_EXPECT_OK(coord.RequestStop());
-  EXPECT_EQ(coord.Join().code(), Code::INVALID_ARGUMENT);
+  EXPECT_EQ(coord.Join().code(), absl::StatusCode::kInvalidArgument);
 }
 
 TEST(CoordinatorTest, JoinWithoutStop) {
   Coordinator coord;
-  std::unique_ptr<MockQueueRunner> qr(new MockQueueRunner(&coord));
+  std::unique_ptr<MockQueueRunner> qr =
+      std::make_unique<MockQueueRunner>(&coord);
   TF_ASSERT_OK(coord.RegisterRunner(std::move(qr)));
 
   EXPECT_EQ(coord.Join().code(), Code::FAILED_PRECONDITION);
